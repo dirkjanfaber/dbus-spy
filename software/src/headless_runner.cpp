@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <utility>
 
@@ -71,10 +72,17 @@ HeadlessRunner::HeadlessRunner(VeQItem *services, VeQItemDbusProducer *producer,
 	mPollTimer(new QTimer(this))
 {
 	mOptions.pathPattern = normalizePathPattern(mOptions.pathPattern);
-	// Explicitly asking for /History... implies --history.
-	if (mOptions.pathPattern.startsWith("/History", Qt::CaseInsensitive))
+	// Asking for /History... explicitly, or a favorite under it, implies --history.
+	if (mOptions.pathPattern.startsWith("/History", Qt::CaseInsensitive) || !mOptions.favorites.isEmpty())
 		mOptions.showHistory = true;
-	mServiceRx = globToRegex(normalizeServicePattern(mOptions.servicePattern), '.');
+	if (mOptions.favorites.isEmpty()) {
+		mServiceRx = globToRegex(normalizeServicePattern(mOptions.servicePattern), '.');
+	} else {
+		QStringList services;
+		for (const QString &favorite: mOptions.favorites)
+			services.append(QRegularExpression::escape(favorite.section('/', 1, 1)));
+		mServiceRx = QRegularExpression(QString("^(?:%1)$").arg(services.join('|')));
+	}
 	mPathRx = globToRegex(mOptions.pathPattern, '/');
 
 	mSinceStart.start();
@@ -110,10 +118,13 @@ void HeadlessRunner::addItem(VeQItem *item, VeQItem *service)
 		return;
 	if (!mPathRx.match(path).hasMatch())
 		return;
+	int favorite = mOptions.favorites.indexOf(item->getRelId(mServices));
+	if (!mOptions.favorites.isEmpty() && favorite == -1)
+		return;
 
 	// No GetValue/GetText here: the service's bulk GetItems call delivers the values, also when
 	// the service comes back after a restart.
-	mEntries.insert(item, {service, path, format(item)});
+	mEntries.insert(item, {service, path, favorite, format(item)});
 	if (mOptions.text) {
 		connect(item, &VeQItem::textChanged, this, [this, item] { onItemChanged(item); });
 		// A service that stops or restarts only changes the state of an empty text: Qt treats
@@ -174,19 +185,19 @@ void HeadlessRunner::finishLoading()
 
 int HeadlessRunner::printValues()
 {
-	QStringList lines;
+	QList<std::pair<int, QString>> lines;
 	for (auto it = mEntries.begin(); it != mEntries.end(); ++it) {
 		// Read the value again: not every change is signalled, e.g. true becoming 1 (equal QVariants).
 		it->last = format(it.key());
 		// Not Synchronized: a folder such as /Dc, or a path that no longer exists on the service.
 		if (it.key()->getState() == VeQItem::Synchronized)
-			lines.append(QString("%1 %2 %3").arg(it->service->id(), it->path, it->last));
+			lines.append({it->favorite, QString("%1 %2 %3").arg(it->service->id(), it->path, it->last)});
 	}
-	lines.sort();
+	std::sort(lines.begin(), lines.end());
 	// A watch starts with the current values, timestamped like the changes that follow.
 	QString prefix = mOptions.watch ? timestamp() + ' ' : QString();
-	for (const QString &line: lines) {
-		if (!writeLine(prefix + line))
+	for (const auto &line: lines) {
+		if (!writeLine(prefix + line.second))
 			break;
 	}
 	return lines.size();
